@@ -1,0 +1,2613 @@
+
+# Loading packages and fonts
+
+extrafont::loadfonts(device = "win")
+
+require(tidyverse)
+require(tidylog)
+require(DataExplorer)
+require(missForest)
+require(doParallel)
+require(h2o)
+require(caret)
+require(doSNOW)
+require(cowplot)
+
+
+
+# Support functions
+# 
+get.season <- function(DATES) {
+WS <- as.Date("2016-12-21", format = "%Y-%m-%d") # Summer
+SE <- as.Date("2016-3-20",  format = "%Y-%m-%d") # Fall
+SS <- as.Date("2016-6-20",  format = "%Y-%m-%d") # Winter
+FE <- as.Date("2016-9-22",  format = "%Y-%m-%d") # Spring
+
+# Convert dates from any year to 2016 dates (Leap year)
+d <- as.Date(strftime(DATES, format="2016-%m-%d"))
+
+as.factor(ifelse (d >= WS | d < SE, "Verao",
+                  ifelse (d >= SE & d < SS, "Outono",
+                          ifelse (d >= SS & d < FE, "Inverno", "Primavera"))))
+}
+
+# Mean absolute percentage error
+smape <- function(obs, pred) {
+  smape <- mean(abs(pred-obs) / ((obs + pred)/2))*100
+  
+  return(smape)
+}
+
+# Relative prediction error 
+rpe <- function(obs, pred) {
+  rmse <- caret::RMSE(pred = pred,
+                      obs = obs)
+  rpe <- (rmse/mean(obs)) *100
+  
+  return(rpe)
+}
+
+
+ModelEvaluation <- function(model, train , validate,
+                            y.train, y.val){
+  
+  require(hydroGOF)
+  
+  y.train <- as.data.frame(y.train)
+  y.val <- as.data.frame(y.val)
+  
+  pred.train <- as.data.frame(predict(object = model, newdata = train))
+  pred.train <- data.frame(pred = pred.train)
+  
+  pred.val <- as.data.frame(predict(object = model, newdata = validate))
+  pred.val <- data.frame(pred = pred.val)
+  
+  
+  r2.train <- caret::R2(pred = pred.train$pred,
+                        obs = y.train$y.train)
+  
+  rmse.train <- caret::RMSE(pred = pred.train$pred,
+                            obs = y.train$y.train)
+  
+  mae.train <- caret::MAE(pred = pred.train$pred,
+                          obs = y.train$y.train)
+  
+  rpe.train <- rpe(pred = pred.train$pred,
+                   obs = y.train$y.train)
+  
+  smape.train <- smape(pred = pred.train$pred,
+                       obs = y.train$y.train)
+  
+  sdr.train <- rSD(sim = pred.train$pred,
+                   obs = y.train$y.train)
+  
+  r2.validation <- caret::R2(pred = pred.val$pred,
+                             obs = y.val$y.val)
+  
+  rmse.validation <- caret::RMSE(pred = pred.val$pred,
+                                 obs = y.val$y.val)
+  
+  mae.validation <- caret::MAE(pred = pred.val$pred,
+                               obs = y.val$y.val)
+  
+  rpe.validation <- rpe(pred = pred.val$pred,
+                        obs = y.val$y.val)
+  
+  smape.validation <- smape(pred = pred.val$pred,
+                            obs = y.val$y.val)
+  
+  sdr.validation <- rSD(sim = pred.val$pred,
+                        obs = y.val$y.val)
+  
+  res <- data.frame(metric = c("R2.train", "RMSE.train", "MAE.train", "rpe.train",
+                               "smape.train", "SDr.train", "R2.validation", "RMSE.validation",
+                               "MAE.validation", "rpe.validation", "smape.validation", "SDr.validation"),
+                    result = c(r2.train, rmse.train, mae.train, rpe.train, smape.train,
+                               sdr.train, r2.validation, rmse.validation, mae.validation, rpe.validation,
+                               smape.validation, sdr.validation))
+  return(res)
+  
+}
+
+
+
+# Loading data
+
+hol1 <- read.csv(
+  "C:/Users/gabri/Documents/Eventos/2019 ZOOTEC/milk prod over years/complete_lactations.csv",
+  header= T,
+  sep= ";",
+  dec= ",",
+  na.strings = c("NA", "?", "")) %>% 
+  rename("Raca" = "RaÃ§a")
+
+names(hol1) <- tolower(names(hol1))
+
+
+
+# Formatanddo as datas
+hol1$data.nascimento <- as.Date(hol1$data.nascimento, format= "%d/%m/%y")
+hol1$data.parto <- as.Date(hol1$data.parto, format= "%d/%m/%y")
+hol1$datamorte <- as.Date(hol1$datamorte, format= "%d/%m/%y")
+
+
+# Calving seasons
+hol1$estacao.parto <- get.season(hol1$data.parto)
+
+
+# Calving year
+hol1$ano.parto <- lubridate::year(hol1$data.parto)
+
+
+# Calving age in months
+
+# turn a date into a 'monthnumber' relative to an origin
+monnb <- function(d) {
+  lt <- as.POSIXlt(as.Date(d, origin="1900-01-01"))
+  lt$year*12 + lt$mon
+} 
+
+# compute a month difference as a difference between two months
+mondf <- function(d1, d2) {
+  monnb(d1) - monnb(d2)
+}
+
+
+hol1$idade.parto <- mondf(d2 = hol1$data.nascimento, d1 = hol1$data.parto)
+
+
+
+# Dry period length info is associated with the end of the past lactation
+# Eg. 60 day dry period length on 1st lactation indicates the dry period 
+# between 1st and 2nd lactation. Fixing that
+
+
+hol2 <- hol1 %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(id.animal = factor(id.animal),
+         ordem.parto = factor(ordem.parto),
+         numeroordenhas = factor(numeroordenhas)) %>% 
+  select(-idadeparto, -ordem.parto) %>% 
+  rename(ordem.parto = ordem.parto.ok) %>% 
+  arrange(id.animal, ordem.parto) %>%
+  group_by(id.animal) %>% 
+  mutate(prev.lac = lag(ordem.parto)) %>%
+  mutate(diasseco.ok = ifelse((ordem.parto - prev.lac) == 1, diasseco, NA)) %>%
+  ungroup() %>% 
+  select(-diasseco, -prev.lac) %>%
+  rename(diasseco = diasseco.ok) %>% 
+  
+  # Keeping only Holstein cows
+  filter(raca == "HOLANDES")%>%
+  droplevels()
+
+
+
+summary(hol2)
+
+
+length(unique(hol2$cliente))
+length(unique(hol2$id.animal))
+
+summary(hol2$ano.parto)
+
+
+# Cleaning #####
+
+hol3 <- hol2 %>%
+  
+  # Removing duplicated observaions based on ID Animal, year, and calving season
+  distinct(id.animal, ano.parto, estacao.parto, .keep_all = TRUE) %>% 
+  
+  
+  # Removing first lactation data
+  filter(ordem.parto != 1)
+
+
+
+# Outliers ####
+
+# Frequency analysis between calving age and lactation number
+
+
+length(hol3$idade.parto[hol3$ordem.parto == 2])
+plot(density(hol3$idade.parto[hol3$ordem.parto == 2]))
+
+
+length(hol3$idade.parto[hol3$ordem.parto == 2 & hol3$idade.parto %in% c(29:60)])
+plot(density(hol3$idade.parto[hol3$ordem.parto == 2 & hol3$idade.parto %in% c(29:60)]))# == 1 & hol3$idade.parto %in% c(20:40)]))
+
+# Second calving = 29 e 60 months
+
+
+length(hol3$idade.parto[hol3$ordem.parto == 3])
+plot(density(hol3$idade.parto[hol3$ordem.parto == 3]))
+
+
+length(hol3$idade.parto[hol3$ordem.parto == 2 & hol3$idade.parto %in% c(38:70)])
+plot(density(hol3$idade.parto[hol3$ordem.parto == 2 & hol3$idade.parto %in% c(38:70)]))# == 1 & hol3$idade.parto %in% c(20:40)]))
+
+# 3rd calving = 38 e 70 months
+
+
+
+length(hol3$idade.parto[hol3$ordem.parto == 4])
+plot(density(hol3$idade.parto[hol3$ordem.parto == 4]))
+
+
+length(hol3$idade.parto[hol3$ordem.parto == 4 & hol3$idade.parto %in% c(47:90)])
+plot(density(hol3$idade.parto[hol3$ordem.parto == 4 & hol3$idade.parto %in% c(47:90)]))# == 1 & hol3$idade.parto %in% c(20:40)]))
+
+# 4th calving = 47 e 90 months
+
+
+length(hol3$idade.parto[hol3$ordem.parto == 5])
+plot(density(hol3$idade.parto[hol3$ordem.parto == 5]))
+
+
+length(hol3$idade.parto[hol3$ordem.parto == 5 & hol3$idade.parto %in% c(60:110)])
+plot(density(hol3$idade.parto[hol3$ordem.parto == 5 & hol3$idade.parto %in% c(60:110)]))# == 1 & hol3$idade.parto %in% c(20:40)]))
+
+# 5th calving = 60 e 110 months
+
+
+
+length(hol3$idade.parto[hol3$ordem.parto > 5])
+plot(density(hol3$idade.parto[hol3$ordem.parto > 5]))
+
+
+length(hol3$idade.parto[hol3$ordem.parto > 5 & hol3$idade.parto %in% c(70:130)])
+plot(density(hol3$idade.parto[hol3$ordem.parto == 5 & hol3$idade.parto %in% c(70:130)]))# == 1 & hol3$idade.parto %in% c(20:40)]))
+
+# 6+ calving = 70 e 130 months
+
+
+hol4 <- hol3 %>% 
+  mutate(remove = ifelse(ordem.parto == 2 & !(idade.parto %in% c(29:60)), "yes",
+                         ifelse(ordem.parto == 3 & !(idade.parto %in% c(38:70)), "yes",
+                                ifelse(ordem.parto == 4 & !(idade.parto %in% c(47:90)), "yes", 
+                                       ifelse(ordem.parto == 5 & !(idade.parto %in% c(60:110)), "yes",
+                                              ifelse(ordem.parto > 5 & !(idade.parto %in% c(70:130)), "yes","no")
+                                       ))))) %>% 
+  filter(remove == "no") %>%
+  
+  # Grouping data from lactation number greater than 6 to 6+
+  mutate(ordem.parto.stats = factor(ifelse(ordem.parto > 5,
+                                           "6+", ordem.parto),
+                                    levels = c("2", "3", "4", "5", "6+"))) 
+
+summary(hol4)
+
+
+
+# Keeping lactation lenght of maximum 600 days
+
+
+hol6 <- hol4 %>%
+  mutate(diaslactacao = ifelse(diaslactacao == 0 & prodleite305dias != 0, NA, diaslactacao)) %>%
+  filter(is.na(diaslactacao) == TRUE | diaslactacao %in% c(1:600)) %>%
+  
+  # Removing missing data on dry period length and keeping dry period length max 120 days
+  filter(is.na(diasseco) == FALSE) %>% 
+  filter(diasseco < 121)
+
+
+# Cleaning production variables
+hol6 %>% 
+  select(prodleite305dias, prodgord305dias, prodprot305dias, prodlactose305dias, 
+         prodsolidos305dias) %>% 
+  DataExplorer::plot_histogram()
+
+
+
+hol6 %>% 
+  select(prodleite305dias, prodgord305dias, prodprot305dias, prodlactose305dias, 
+         prodsolidos305dias) %>% 
+  DataExplorer::plot_histogram()
+
+
+
+# Removing outliers on production variables based on Leys et al.(2013; DOI: 10.1016/j.jesp.2013.03.013)
+
+milk <- hol6 %>%
+  select(ano.parto, ordem.parto.stats, prodleite305dias) %>%  
+  group_by(ano.parto, ordem.parto.stats) %>% 
+  summarise_all(list(md = median, mad = mad), na.rm = T) %>% 
+  mutate(mad = 2.5*mad) %>% 
+  mutate(min.milk = md-mad,
+         max.milk = md+mad)
+
+
+fat <- hol6 %>%
+  select(ano.parto, ordem.parto.stats, prodgord305dias) %>%  
+  group_by(ano.parto, ordem.parto.stats) %>% 
+  summarise_all(list(md = median, mad = mad), na.rm = T) %>% 
+  mutate(mad = 2.5*mad) %>% 
+  mutate(min.fat = md-mad,
+         max.fat = md+mad)
+
+
+
+prot <- hol6 %>%
+  select(ano.parto, ordem.parto.stats, prodprot305dias) %>%  
+  group_by(ano.parto, ordem.parto.stats) %>% 
+  summarise_all(list(md = median, mad = mad), na.rm = T) %>% 
+  mutate(mad = 2.5*mad) %>% 
+  mutate(min.prot = md-mad,
+         max.prot = md+mad)
+
+
+lactose <- hol6 %>%
+  select(ano.parto, ordem.parto.stats, prodlactose305dias) %>%  
+  group_by(ano.parto, ordem.parto.stats) %>% 
+  summarise_all(list(md = median, mad = mad), na.rm = T) %>% 
+  mutate(mad = 2.5*mad) %>% 
+  mutate(min.lactose = md-mad,
+         max.lactose = md+mad)
+
+
+solid <- hol6 %>%
+  select(ano.parto, ordem.parto.stats, prodsolidos305dias) %>%  
+  group_by(ano.parto, ordem.parto.stats) %>% 
+  summarise_all(list(md = median, mad = mad), na.rm = T) %>% 
+  mutate(mad = 2.5*mad) %>% 
+  mutate(min.solid = md-mad,
+         max.solid = md+mad)
+
+
+hol7 <- hol6 %>% 
+  left_join(milk, by = c("ano.parto", "ordem.parto.stats")) %>% 
+  left_join(fat, by = c("ano.parto", "ordem.parto.stats")) %>% 
+  left_join(prot, by = c("ano.parto", "ordem.parto.stats")) %>% 
+  left_join(lactose, by = c("ano.parto", "ordem.parto.stats")) %>% 
+  left_join(solid, by = c("ano.parto", "ordem.parto.stats"))
+
+
+
+# Removing outliers
+
+hol8 <- hol7 %>% 
+  filter(is.na(prodleite305dias) == TRUE | (prodleite305dias >= min.milk & prodleite305dias <= max.milk)) %>%
+  filter(is.na(prodgord305dias) == TRUE | (prodgord305dias >= min.fat & prodgord305dias <= max.fat)) %>%
+  filter(is.na(prodprot305dias) == TRUE | (prodprot305dias > min.prot & prodprot305dias < max.prot)) %>%
+  filter(is.na(prodlactose305dias) == TRUE | (prodlactose305dias > min.lactose & prodlactose305dias < max.lactose)) %>%
+  filter(is.na(prodsolidos305dias) == TRUE | (prodsolidos305dias > min.solid & prodsolidos305dias < max.solid))
+
+
+
+hol8 %>% 
+  select(prodleite305dias, prodgord305dias, prodprot305dias, prodlactose305dias, 
+         prodsolidos305dias) %>% 
+  DataExplorer::plot_histogram()
+
+
+
+# Keeping only variables of interest ####
+
+
+hol9 <- hol8 %>% 
+  dplyr::select(cliente, id.animal, ano.parto, estacao.parto, status.do.nascimento.da.cria,
+                numeroordenhas,  idade.parto, ordem.parto.stats, diaslactacao, diasseco,
+                prodleite305dias, prodgord305dias, prodprot305dias, prodlactose305dias, 
+                prodsolidos305dias)
+
+
+# Exploring missing data
+
+DataExplorer::plot_missing(hol9)
+
+n.NA <- hol9 %>%
+  group_by(cliente) %>%
+  summarise_all(~sum(is.na(.))) %>%
+  transmute(cliente, sumNA = rowSums(.[-1]))
+
+n.NON_NA <- hol9 %>%
+  group_by(cliente) %>%
+  summarise_all(~sum(!is.na(.))) %>%
+  transmute(cliente, sumNON_NA = rowSums(.[-1]))
+
+n.NA %>%
+  left_join(n.NON_NA, by = "cliente") %>%
+  mutate(percNA = round((sumNA/sumNON_NA)*100, 0)) %>%
+  arrange(desc(percNA)) %>% 
+  summarise(min = min(percNA),
+            max = max(percNA),
+            mean = mean(percNA),
+            sd = sd(percNA))
+
+# highest of 14% of missing data per herd
+
+
+# Using multiple imputation based on a random forest model  ####
+
+hol9.impu <- hol9 %>%
+  select(-cliente, -id.animal) %>%
+  data.frame()
+
+
+
+
+cl <- makePSOCKcluster(4)
+registerDoParallel(cl, cores = 4)
+
+getDoParWorkers()
+
+
+set.seed(1801)
+
+imputed <- missForest(xmis = hol9.impu,
+                      verbose = TRUE,
+                      variablewise = TRUE,
+                      parallelize = "forests")
+
+stopCluster(cl)
+
+
+imputed$OOBerror
+
+
+
+hol.final <- hol9 %>%
+  select(cliente, id.animal) %>%
+  cbind(imputed$ximp)
+
+# Savinf imputed data
+
+write.csv(hol.final,
+          paste(Sys.Date(), "final_imputed_data.csv",
+                sep = "_"),
+          row.names = FALSE)
+
+
+
+# Exploratory analysis ####
+
+
+length(unique(hol.final$id.animal))
+length(unique(hol.final$cliente))
+
+summary(hol.final$ano.parto)
+
+
+
+summary(hol.final)
+
+DataExplorer::plot_missing(hol.final)
+
+DataExplorer::plot_bar(hol.final)
+
+DataExplorer::plot_histogram(hol.final)
+
+DataExplorer::plot_correlation(hol.final, type = "continuous", 
+                               cor_args = c(use = "pairwise.complete.obs"))
+
+DataExplorer::plot_correlation(hol.final, type = "discrete", 
+                               cor_args = c(use = "pairwise.complete.obs"))
+
+
+hol.final %>%
+  dplyr::select(-cliente, -id.animal) %>% 
+  select_if(is.factor) %>%
+  summarytools::freq()
+
+
+options(pillar.sigfig=5)
+hol.final %>% 
+  select_if(is.numeric) %>%
+  select(-ano.parto) %>% 
+  skimr::skim()
+
+
+hol.ml <- hol.final %>% 
+  select(-id.animal)
+
+rm(list=setdiff(ls(), "hol.ml"))
+
+# VIF 
+lm(prodleite305dias ~ ., data = hol.ml %>% 
+     select(-prodgord305dias, -prodprot305dias, -prodlactose305dias, -prodsolidos305dias)) %>% 
+  car::vif() %>% round(2)
+
+
+
+
+# Spliting data ####
+# Splitting data into training and validation files (75:25)
+# based on the outcome variable
+
+
+set.seed(1810)
+splitIndex <- splitTools::partition(hol.ml$prodleite305dias, 
+                                    # p = c(train = 0.6, valid = 0.2, test = 0.2),
+                                    p = c(train = 0.75, valid = 0.25))
+
+train.milk <- hol.ml[splitIndex$train,] %>% 
+  select(-prodgord305dias, -prodprot305dias, -prodlactose305dias, -prodsolidos305dias)
+# wd.test  <- hol.ml[splitIndex$test,]
+valid.milk <- hol.ml[splitIndex$valid,] %>% 
+  select(-prodgord305dias, -prodprot305dias, -prodlactose305dias, -prodsolidos305dias)
+
+
+
+set.seed(1810)
+splitIndex <- splitTools::partition(hol.ml$prodgord305dias, 
+                                    p = c(train = 0.75, valid = 0.25))
+
+train.fat <- hol.ml[splitIndex$train,] %>% 
+  select(-prodleite305dias, -prodprot305dias, -prodlactose305dias, -prodsolidos305dias)
+valid.fat <- hol.ml[splitIndex$valid,] %>% 
+  select(-prodleite305dias, -prodprot305dias, -prodlactose305dias, -prodsolidos305dias)
+
+
+
+set.seed(1810)
+splitIndex <- splitTools::partition(hol.ml$prodprot305dias, 
+                                    p = c(train = 0.75, valid = 0.25))
+
+train.prot <- hol.ml[splitIndex$train,] %>% 
+  select(-prodleite305dias, -prodgord305dias, -prodlactose305dias, -prodsolidos305dias)
+valid.prot <- hol.ml[splitIndex$valid,] %>% 
+  select(-prodleite305dias, -prodgord305dias, -prodlactose305dias, -prodsolidos305dias)
+
+
+
+set.seed(1810)
+splitIndex <- splitTools::partition(hol.ml$prodlactose305dias, 
+                                    p = c(train = 0.75, valid = 0.25))
+
+train.lactose <- hol.ml[splitIndex$train,] %>% 
+  select(-prodleite305dias, -prodgord305dias, -prodprot305dias, -prodsolidos305dias)
+valid.lactose <- hol.ml[splitIndex$valid,] %>% 
+  select(-prodleite305dias, -prodgord305dias, -prodprot305dias, -prodsolidos305dias)
+
+
+
+set.seed(1810)
+splitIndex <- splitTools::partition(hol.ml$prodsolidos305dias, 
+                                    p = c(train = 0.75, valid = 0.25))
+
+train.solid <- hol.ml[splitIndex$train,] %>% 
+  select(-prodleite305dias, -prodgord305dias, -prodprot305dias, -prodlactose305dias)
+valid.solid <- hol.ml[splitIndex$valid,] %>% 
+  select(-prodleite305dias, -prodgord305dias, -prodprot305dias, -prodlactose305dias)
+
+
+# Shift Detection ####
+# Evaluating if training set is "different" than the testing set
+# If the classifier is able to classify the rows into train and test with good 
+# accuracy, our AUC score should be on the higher side (greater than 0.8). 
+# This implies strong covariate shift between train and test.
+
+
+shift.milk <- train.milk %>%
+  mutate(type = "train") %>%
+  bind_rows(valid.milk %>%
+              mutate(type = "test")) %>% 
+  mutate(type = factor(type)) %>% 
+  as.data.frame()
+
+
+shift.fat <- train.fat %>%
+  mutate(type = "train") %>%
+  bind_rows(valid.fat %>%
+              mutate(type = "test")) %>% 
+  mutate(type = factor(type)) %>% 
+  as.data.frame()
+
+
+shift.prot <- train.prot %>%
+  mutate(type = "train") %>%
+  bind_rows(valid.prot %>%
+              mutate(type = "test")) %>% 
+  mutate(type = factor(type)) %>% 
+  as.data.frame()
+
+
+shift.lactose <- train.lactose %>%
+  mutate(type = "train") %>%
+  bind_rows(valid.lactose %>%
+              mutate(type = "test")) %>% 
+  mutate(type = factor(type)) %>% 
+  as.data.frame()
+
+
+
+shift.solid <- train.solid %>%
+  mutate(type = "train") %>%
+  bind_rows(valid.solid %>%
+              mutate(type = "test")) %>% 
+  mutate(type = factor(type)) %>% 
+  as.data.frame()
+
+save.image(paste(Sys.Date(), "Random_Models_Image.RData", sep = "_"))
+
+
+# Random forest model
+
+
+h2o.init(nthreads = -1)
+
+# Import the shift dataset into H2O:
+h2o.shift.milk <- as.h2o(shift.milk)
+h2o.shift.fat <- as.h2o(shift.fat)
+h2o.shift.prot <- as.h2o(shift.prot)
+h2o.shift.lactose <- as.h2o(shift.lactose)
+h2o.shift.solid <- as.h2o(shift.solid)
+
+
+# Build and train the models:
+rf_milk <- h2o.randomForest(y = "type",
+                            training_frame = h2o.shift.milk,
+                            nfolds = 10,
+                            seed = 1801,
+                            model_id = "shift_milk_model")
+
+h2o.saveModel(rf_milk, path = getwd(), force = TRUE)
+
+
+rf_fat <- h2o.randomForest(y = "type",
+                           training_frame = h2o.shift.fat,
+                           nfolds = 10,
+                           seed = 1801,
+                           model_id = "shift_fat_model")
+
+h2o.saveModel(rf_fat, path = getwd(), force = TRUE)
+
+
+rf_prot <- h2o.randomForest(y = "type",
+                            training_frame = h2o.shift.prot,
+                            nfolds = 10,
+                            seed = 1801,
+                            model_id = "shift_prot_model")
+
+h2o.saveModel(rf_prot, path = getwd(), force = TRUE)
+
+
+rf_lactose <- h2o.randomForest(y = "type",
+                               training_frame = h2o.shift.lactose,
+                               nfolds = 10,
+                               seed = 1801,
+                               model_id = "shift_lactose_model")
+
+h2o.saveModel(rf_lactose, path = getwd(), force = TRUE)
+
+
+rf_solid <- h2o.randomForest(y = "type",
+                             training_frame = h2o.shift.solid,
+                             nfolds = 10,
+                             seed = 1801,
+                             model_id = "shift_solid_model")
+
+h2o.saveModel(rf_solid, path = getwd(), force = TRUE)
+
+
+h2o.auc(h2o.performance(rf_milk)) %>% round(3)
+h2o.auc(h2o.performance(rf_fat)) %>% round(3)
+h2o.auc(h2o.performance(rf_prot)) %>% round(3)
+h2o.auc(h2o.performance(rf_lactose)) %>% round(3)
+h2o.auc(h2o.performance(rf_solid)) %>% round(3)
+
+h2o.shutdown(FALSE)
+
+# AUC value of 0.50 implies that there is no evidence of strong covariate shift.
+# This means that majority of the observations comes from a feature space 
+# which is not specific to test or train.
+
+
+# Milk production ####
+
+# Creating folds for 10 fold cross-validation
+set.seed(1801)
+folds <- createFolds(train.milk$prodleite305dias, k = 10, list=TRUE)
+
+
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "random",
+                            index = folds,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", complete = TRUE),
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+
+cl <- makePSOCKcluster(4)
+registerDoParallel(cl, cores = 4)
+
+getDoParWorkers()
+
+
+# Gradient boosting machine ####
+
+set.seed(1801)
+gbm_milk <- train(prodleite305dias ~ ., 
+                  data = train.milk, 
+                  method = "gbm",
+                  metric = "RMSE",
+                  trControl = fit_control,
+                  # tuneGrid = expand.grid(interaction.depth = seq(1, 10, by = 1), 
+                  #                        n.trees = seq(1000, 5000, by = 500), 
+                  #                        shrinkage = seq(0.05, 0.55, by = 0.05),
+                  #                        n.minobsinnode = seq(20, 100, by = 10)),
+                  tuneLength = 30)
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+# Extreme gradient boosting machine ####
+
+set.seed(1801)
+xgbm_milk <- train(prodleite305dias ~ ., 
+                   data = train.milk, 
+                   method = "xgbTree",
+                   metric = "RMSE",
+                   trControl = fit_control,
+                   # tuneGrid = expand.grid(eta = seq(0.05, 0.55, by = 0.05),
+                   #                        max.depth = seq(1, 10, by = 1),
+                   #                        gamma = seq(2, 6, by = 0.5),
+                   #                        colsample_bytree = seq(0.45, 0.60, by = 0.05),
+                   #                        min_child_weight = seq(1, 20, by = 1), 
+                   #                        subsample = seq(0.30, 0.40, by = 0.01),
+                   #                        nrounds = seq(700, 1000, by = 50)),
+                   tuneLength = 30)
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+# Random Forest ####
+
+set.seed(1801)
+rf_milk <- train(prodleite305dias ~ ., 
+                 data = train.milk, 
+                 method = "ranger",
+                 metric = "RMSE",
+                 trControl = fit_control,
+                 tuneLength = 30)
+
+stopCluster(cl)
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+# Artificial neural network ####
+folds.h2o <- data.frame(row.number = integer(),
+                        folds = numeric())
+
+for(i in c(1:10)) {
+  
+  folds.h2o <- folds[[i]] %>% 
+    as.data.frame() %>% 
+    rename("row.number" = ".") %>% 
+    mutate(folds = i) %>% 
+    rbind(folds.h2o)
+  
+}
+
+
+# Import data into H2O
+require(h2o)
+
+h2o.init(nthreads = -1)
+
+h2o.train.milk <- as.h2o(train.milk %>% 
+                           mutate(row.number = c(1:length(diasseco))) %>% 
+                           left_join(folds.h2o, by = "row.number") %>% 
+                           select(-row.number))
+h2o.valid.milk <- as.h2o(valid.milk) # For the validation of the model
+
+
+
+# Grid for random hyperparameters search
+hyper_params <- list(
+  activation = c("RectifierWithDropout", "TanhWithDropout", "MaxoutWithDropout"),
+  hidden = list(c(150, 150), c(rep(150, 3)), c(rep(150, 4)),
+                c(200, 200), c(rep(200, 3)), c(rep(200, 4)),
+                c(250, 250), c(rep(250, 3)), c(rep(250, 4))),
+  input_dropout_ratio = c(0, 0.05, 0.10, 0.15))
+
+hyper_params
+
+
+
+ann_search <- h2o.grid(algorithm="deeplearning",
+                       grid_id = "dl_grid_random",
+                       y = "prodleite305dias",
+                       training_frame = h2o.train.milk,
+                       fold_column = "folds",
+                       max_w2 = 10, # can help improve stability for Rectifier
+                       seed = 1801,
+                       model_id = "h2o.ANN.milk",
+                       reproducible = TRUE, 
+                       hyper_params = hyper_params,
+                       search_criteria = list(strategy = "RandomDiscrete",
+                                              stopping_metric = "RMSE",
+                                              stopping_tolerance = 0.0001,
+                                              stopping_rounds = 5)
+)
+
+
+grid <- h2o.getGrid("dl_grid_random",
+                    sort_by = "RMSE",
+                    decreasing=FALSE)
+grid
+
+ann_milk <- h2o.getModel(grid@model_ids[[1]]) ## model with lowest RMSE
+ann_milk
+
+
+h2o.saveModel(ann_milk, path = getwd(), force = TRUE)
+
+# ann_milk <- h2o.loadModel("dl_grid_random_model_8")
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+
+# Evaluating models ####
+names(train.milk)
+
+res.milk <- ModelEvaluation(gbm_milk, 
+                            train.milk, valid.milk, 
+                            train.milk$prodleite305dias, valid.milk$prodleite305dias)%>% 
+  rename("GBM" = "result") %>% 
+  right_join(
+    ModelEvaluation(xgbm_milk, 
+                    train.milk, valid.milk, 
+                    train.milk$prodleite305dias, valid.milk$prodleite305dias)%>% 
+      rename("XGBM" = "result") , by = "metric") %>% 
+  right_join(ModelEvaluation(rf_milk, 
+                             train.milk, valid.milk, 
+                             train.milk$prodleite305dias, valid.milk$prodleite305dias)%>% 
+               rename("RF" = "result"), by = "metric") %>% 
+  right_join(ModelEvaluation(ann_milk,
+                             h2o.train.milk, h2o.valid.milk,
+                             train.milk$prodleite305dias, valid.milk$prodleite305dias) %>%
+               rename("ANN" = "result"),
+             by = "metric")
+
+res.milk[7:12,] %>% 
+  print(digits = 2)
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+
+h2o.shutdown(prompt = FALSE)
+
+
+# Interpreting the model  ####
+# Random forest was the best model
+require(iml)
+require(flashlight)
+require(future)
+require(future.callr)
+
+predictor.milk <- Predictor$new(model = rf_milk, 
+                                data = hol.ml %>% 
+                                  select(-prodgord305dias, -prodprot305dias, -prodlactose305dias, -prodsolidos305dias), 
+                                y = "prodleite305dias")
+
+var.names.interaction <- hol.ml %>% 
+  select(-cliente, -ano.parto, -estacao.parto, -prodleite305dias, 
+         -prodgord305dias, -prodprot305dias, -prodlactose305dias, 
+         -prodsolidos305dias) %>% 
+  names()
+
+flashlight.milk <- flashlight(model = rf_milk, 
+                              data = hol.ml %>% 
+                                select(-prodgord305dias, -prodprot305dias, -prodlactose305dias, -prodsolidos305dias), 
+                              y = "prodleite305dias",
+                              label = "flashlight.milk")
+
+# Variable importance
+
+# Creates a PSOCK cluster with 3 cores (4 cores crashed my computer)
+plan("callr", workers = 3)
+imp.milk <- FeatureImp$new(predictor.milk, loss = "rmse")
+
+windowsFonts(Times=windowsFont("TT Times New Roman"))
+
+
+varImpPlot.milk <- ggplot(data = imp.milk$results %>% 
+                            mutate(feature = recode(feature, diaslactacao = "Lactation length",
+                                                    cliente = "Herd",
+                                                    ano.parto = "Calving year",
+                                                    numeroordenhas = "Milking frequency",
+                                                    diasseco = "Dry period length",
+                                                    estacao.parto = "Calving season",
+                                                    idade.parto = "Calving age",
+                                                    status.do.nascimento.da.cria = "Calf status at birth",
+                                                    ordem.parto.stats = "Parity number")) %>% 
+                            filter(!(feature %in% c("Herd", "Calving year", "Calving season"))),
+                          aes(x = importance,
+                              y = reorder(feature, + importance))) +
+  geom_col(width = 0.03,
+           colour = NA, 
+           fill = "black") +
+  geom_point(shape = 23, fill="dodgerblue3", color="dodgerblue3",
+             size = 2) +
+  theme_classic(base_family = "Times New Roman") + 
+  expand_limits(x = 0, y = 0) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.045)),
+                     breaks = seq(0, 3.5, by = 0.5),
+                     limits = c(0, 3.5)) + 
+  coord_cartesian(xlim=c(0.8, 3.5)) + 
+  labs(x = "Variable importance") + 
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"),
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 10))
+
+
+varImpPlot.milk
+
+ggsave(varImpPlot.milk, filename = paste(Sys.Date(), "MILK_VarImp_Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+
+# Interactions
+interact.milk <- light_interaction(x = flashlight.milk,
+                                   v = var.names.interaction,
+                                   type = "H",
+                                   seed = 1801)
+
+
+interact.milk.Plot <- interact.milk$data %>% 
+  mutate(variable = recode(variable, diaslactacao = "Lactation length",
+                           numeroordenhas = "Milking frequency",
+                           diasseco = "Dry period length",
+                           idade.parto = "Calving age",
+                           status.do.nascimento.da.cria = "Calf status at birth",
+                           ordem.parto.stats = "Parity number")) %>% 
+  ggplot(aes(x = value,
+             y = reorder(variable, + value))) +
+  geom_col(width = 0.03,
+           colour = NA, 
+           fill = "black") +
+  geom_point(shape = 23, fill="dodgerblue3", color="dodgerblue3",
+             size = 2) +
+  theme_classic() + 
+  expand_limits(x = 0, y = 0) +
+  scale_x_continuous(limits = c(0, 0.25),
+                     breaks = seq(0, 0.25, by = 0.05),
+                     expand = expansion(mult = c(0, 0.045))) + 
+  labs(x = "Interaction strengtht") + 
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"), 
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 10))
+
+interact.milk.Plot
+
+ggsave(interact.milk.Plot, filename = paste(Sys.Date(), "interact.milk.Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+
+
+# Exploring interactions with dry period
+interact.milk.diasseco <- light_interaction(x = flashlight.milk,
+                                            v = var.names.interaction,
+                                            pairwise = TRUE,
+                                            type = "H",
+                                            seed = 1801)
+
+
+
+
+interact.milk.diasseco.Plot <- interact.milk.diasseco$data %>% 
+  filter(row_number() %in% grep("diasseco", variable)) %>% 
+  mutate(variable = recode(variable, "diaslactacao:diasseco" = "Lactation length:Dry period length",
+                           "numeroordenhas:diasseco" = "Milking frequency:Dry period length",
+                           "idade.parto:diasseco" = "Calving age:Dry period length",
+                           "status.do.nascimento.da.cria:diasseco" = "Calf status at birth:Dry period length",
+                           "ordem.parto.stats:diasseco" = "Parity number:Dry period length")) %>% 
+  ggplot(aes(x = value,
+             y = reorder(variable, + value))) +
+  geom_col(width = 0.03,
+           colour = NA, 
+           fill = "black") +
+  geom_point(shape = 23, fill="dodgerblue3", color="dodgerblue3",
+             size = 2) +
+  theme_classic() + 
+  expand_limits(x = 0, y = 0) +
+  scale_x_continuous(limits = c(0, 0.08),
+                     breaks = seq(0, 0.08, by = 0.02),
+                     expand = expansion(mult = c(0, 0.045))) + 
+  labs(x = "Interaction strengtht",
+       y = "Interaction") + 
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"), 
+        axis.title = element_text(size = 10))
+
+
+interact.milk.diasseco.Plot
+
+ggsave(interact.milk.diasseco.Plot, filename = paste(Sys.Date(), "interact.milk.diasseco.Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+
+
+
+# Partial dependency plot
+plan("callr", workers = 7)
+pdp.milk <- FeatureEffect$new(predictor.milk, feature = "diasseco", method = "pdp")
+
+pdp.milk.plot <- plot(pdp.milk) +
+  geom_smooth(method = "loess", se = TRUE) +
+  theme_classic(base_family = "Times New Roman") + 
+  scale_x_continuous(limits = c(0, 120),
+                     breaks = seq(0, 120, by = 20),
+                     expand = expansion(mult = c(0, 0.02))) + 
+  scale_y_continuous() + 
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.line = element_line("black"), 
+        axis.title = element_text(size = 10)) + 
+  xlab("Dry period length (day)") + 
+  ylab("Predicted milk production (kg)")
+
+
+ggsave(pdp.milk.plot, filename = paste(Sys.Date(), "MILK_PDP_Dry Period_Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+
+# Calculating milk production loss of short dry period
+perc.loss <- function(ref, comp){
+  round(((comp/ref)-1)*100)
+}
+
+
+high.milk <- max(pdp.milk$results$.value)
+
+# Zero and 25 days
+perc.loss(ref = high.milk,
+          comp = pdp.milk$results$.value[pdp.milk$results$diasseco == 0])
+
+perc.loss(ref = high.milk,
+          comp = pdp.milk$results %>% 
+            mutate(diasseco = round(diasseco)) %>% 
+            filter(diasseco == 25) %>% 
+            pull(.value))
+
+# Partial dependence plot of interactions
+plan("callr", workers = 3)
+pdp.milk.dry.period_parity <- FeatureEffect$new(predictor.milk, 
+                                                feature = c("diasseco", "idade.parto"), 
+                                                method = "pdp")
+
+plot(pdp.milk.dry.period_parity)
+
+
+# Individual conditional Expectation
+plan("callr", workers = 3)
+center.ice.milk <- FeatureEffect$new(predictor.milk, feature = "diasseco",
+                                     center.at = min(hol.ml$diasseco), 
+                                     method = "pdp+ice") 
+
+center.ice.milk.plot <- plot(center.ice.milk) +
+  theme_classic(base_family = "Times New Roman") + 
+  scale_x_continuous(limits = c(0, 120),
+                     breaks = seq(0, 120, by = 20),
+                     expand = expansion(mult = c(0, 0.02))) + 
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.line = element_line("black"), 
+        axis.title = element_text(size = 10)) + 
+  xlab("Dry period length (day)")
+
+ggsave(center.ice.milk.plot, filename = paste(Sys.Date(), "MILK_cICE_Dry Period_Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+# fat production ####
+
+# Creating folds for 10 fold cross-validation
+
+set.seed(1801)
+folds <- createFolds(train.fat$prodgord305dias, k = 10, list=TRUE)
+
+
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "random",
+                            index = folds,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", complete = TRUE),
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+cl <- makePSOCKcluster(4)
+registerDoParallel(cl, cores = 4)
+
+getDoParWorkers()
+
+# Gradient boosting machine ####
+
+set.seed(1801)
+gbm_fat <- train(prodgord305dias ~ ., 
+                 data = train.fat, 
+                 method = "gbm",
+                 metric = "RMSE",
+                 trControl = fit_control,
+                 # tuneGrid = expand.grid(interaction.depth = seq(1, 10, by = 1), 
+                 #                        n.trees = seq(1000, 5000, by = 500), 
+                 #                        shrinkage = seq(0.05, 0.55, by = 0.05),
+                 #                        n.minobsinnode = seq(20, 100, by = 10)),
+                 tuneLength = 30)
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+
+# Extreme gradient boosting machine ####
+
+set.seed(1801)
+xgbm_fat <- train(prodgord305dias ~ ., 
+                  data = train.fat, 
+                  method = "xgbTree",
+                  metric = "RMSE",
+                  trControl = fit_control,
+                  # tuneGrid = expand.grid(eta = seq(0.05, 0.55, by = 0.05),
+                  #                        max.depth = seq(1, 10, by = 1),
+                  #                        gamma = seq(2, 6, by = 0.5),
+                  #                        colsample_bytree = seq(0.45, 0.60, by = 0.05),
+                  #                        min_child_weight = seq(1, 20, by = 1), 
+                  #                        subsample = seq(0.30, 0.40, by = 0.01),
+                  #                        nrounds = seq(700, 1000, by = 50)),
+                  tuneLength = 30)
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+# Random Forest ####
+
+set.seed(1801)
+rf_fat <- train(prodgord305dias ~ ., 
+                data = train.fat, 
+                method = "ranger",
+                metric = "RMSE",
+                trControl = fit_control,
+                tuneLength = 30)
+
+stopCluster(cl)
+
+
+# Artificial neural network ####
+folds.h2o <- data.frame(row.number = integer(),
+                        folds = numeric())
+
+for(i in c(1:10)) {
+  
+  folds.h2o <- folds[[i]] %>% 
+    as.data.frame() %>% 
+    rename("row.number" = ".") %>% 
+    mutate(folds = i) %>% 
+    rbind(folds.h2o)
+  
+}
+
+
+# Import data into H2O
+h2o.init(nthreads = -1)
+
+h2o.train.fat <- as.h2o(train.fat %>% 
+                          mutate(row.number = c(1:length(diasseco))) %>% 
+                          left_join(folds.h2o, by = "row.number") %>% 
+                          select(-row.number))
+h2o.valid.fat <- as.h2o(valid.fat) # For the validation of the model
+
+
+
+# Grid for random hyperparameters search
+hyper_params <- list(
+  activation = c("RectifierWithDropout", "TanhWithDropout", "MaxoutWithDropout"),
+  hidden = list(c(150, 150), c(rep(150, 3)), c(rep(150, 4)),
+                c(200, 200), c(rep(200, 3)), c(rep(200, 4)),
+                c(250, 250), c(rep(250, 3)), c(rep(250, 4))),
+  input_dropout_ratio = c(0, 0.05, 0.10, 0.15))
+
+hyper_params
+
+
+
+ann_search <- h2o.grid(algorithm="deeplearning",
+                       grid_id = "dl_grid_random",
+                       y = "prodgord305dias",
+                       training_frame = h2o.train.fat,
+                       fold_column = "folds",
+                       max_w2 = 10, # can help improve stability for Rectifier
+                       seed = 1801,
+                       model_id = "h2o.ANN.fat",
+                       reproducible = TRUE, 
+                       hyper_params = hyper_params,
+                       search_criteria = list(strategy = "RandomDiscrete",
+                                              stopping_metric = "RMSE",
+                                              stopping_tolerance = 0.0001,
+                                              stopping_rounds = 5)
+)
+
+
+grid <- h2o.getGrid("dl_grid_random",
+                    sort_by = "RMSE",
+                    decreasing=FALSE)
+grid
+
+ann_fat <- h2o.getModel(grid@model_ids[[1]]) ## model with lowest RMSE
+ann_fat
+
+
+h2o.saveModel(ann_fat, path = getwd(), force = TRUE)
+
+# ann_fat <- h2o.loadModel("h2o.ANN.fat")
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+
+# Evaluating models ####
+res.fat <- ModelEvaluation(gbm_fat, 
+                           train.fat, valid.fat, 
+                           train.fat$prodgord305dias, valid.fat$prodgord305dias)%>% 
+  rename("GBM" = "result") %>% 
+  right_join(
+    ModelEvaluation(xgbm_fat, 
+                    train.fat, valid.fat, 
+                    train.fat$prodgord305dias, valid.fat$prodgord305dias)%>% 
+      rename("XGBM" = "result") , by = "metric") %>% 
+  right_join(ModelEvaluation(rf_fat, 
+                             train.fat, valid.fat, 
+                             train.fat$prodgord305dias, valid.fat$prodgord305dias)%>% 
+               rename("RF" = "result"), by = "metric") %>% 
+  right_join(ModelEvaluation(ann_fat,
+                             h2o.train.fat, h2o.valid.fat,
+                             train.fat$prodgord305dias, valid.fat$prodgord305dias) %>%
+               rename("ANN" = "result"),
+             by = "metric")
+
+res.fat[7:10,] %>% 
+  print(digits = 2)
+
+
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+
+h2o.shutdown(prompt = FALSE)
+
+
+# Interpreting the best model ####
+predictor.fat <- Predictor$new(model = rf_fat, 
+                               data = hol.ml %>% 
+                                 select(-prodleite305dias, -prodprot305dias, -prodlactose305dias, -prodsolidos305dias), 
+                               y = "prodgord305dias")
+
+flashlight.fat <- flashlight(model = rf_fat, 
+                             data = hol.ml %>% 
+                               select(-prodleite305dias, -prodprot305dias, -prodlactose305dias, -prodsolidos305dias), 
+                             y = "prodgord305dias",
+                             label = "flashlight.fat")
+
+# Creates a PSOCK cluster with 3 cores (4 cores crashed my computer)
+plan("callr", workers = 3)
+imp.fat <- FeatureImp$new(predictor.fat, loss = "rmse")
+
+windowsFonts(Times=windowsFont("TT Times New Roman"))
+
+
+varImpPlot.fat <- ggplot(data = imp.fat$results %>% 
+                           mutate(feature = recode(feature, diaslactacao = "Lactation length",
+                                                   cliente = "Herd",
+                                                   ano.parto = "Calving year",
+                                                   numeroordenhas = "Milking frequency",
+                                                   diasseco = "Dry period length",
+                                                   estacao.parto = "Calving season",
+                                                   idade.parto = "Calving age",
+                                                   status.do.nascimento.da.cria = "Calf status at birth",
+                                                   ordem.parto.stats = "Parity number")) %>% 
+                           filter(!(feature %in% c("Herd", "Calving year", "Calving season"))),
+                         aes(x = importance,
+                             y = reorder(feature, + importance))) +
+  geom_col(width = 0.03,
+           colour = NA, 
+           fill = "black") +
+  geom_point(shape = 23, fill="dodgerblue3", color="dodgerblue3",
+             size = 2) +
+  theme_classic(base_family = "Times New Roman") + 
+  expand_limits(x = 0, y = 0) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.045)),
+                     breaks = seq(0, 3.5, by = 0.5),
+                     limits = c(0, 3.5)) + 
+  coord_cartesian(xlim=c(0.8, 3)) + 
+  labs(x = "Variable importance") + 
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"), 
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 10))
+
+
+varImpPlot.fat
+
+ggsave(varImpPlot.fat, filename = paste(Sys.Date(), "fat_VarImp_Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+# Interactions
+interact.fat <- light_interaction(x = flashlight.fat,
+                                  v = var.names.interaction,
+                                  type = "H",
+                                  seed = 1801)
+
+
+interact.fat.Plot <- interact.fat$data %>% 
+  mutate(variable = recode(variable, diaslactacao = "Lactation length",
+                           numeroordenhas = "Milking frequency",
+                           diasseco = "Dry period length",
+                           idade.parto = "Calving age",
+                           status.do.nascimento.da.cria = "Calf status at birth",
+                           ordem.parto.stats = "Parity number")) %>% 
+  ggplot(aes(x = value,
+             y = reorder(variable, + value))) +
+  geom_col(width = 0.03,
+           colour = NA, 
+           fill = "black") +
+  geom_point(shape = 23, fill="dodgerblue3", color="dodgerblue3",
+             size = 2) +
+  theme_classic() + 
+  expand_limits(x = 0, y = 0) +
+  scale_x_continuous(limits = c(0, 0.25),
+                     breaks = seq(0, 0.25, by = 0.05),
+                     expand = expansion(mult = c(0, 0.045))) + 
+  labs(x = "Interaction strengtht") + 
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"), 
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 10))
+
+interact.fat.Plot
+
+ggsave(interact.fat.Plot, filename = paste(Sys.Date(), "interact.fat.Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+
+# Exploring interactions with dry period
+interact.fat.diasseco <- light_interaction(x = flashlight.fat,
+                                           v = var.names.interaction,
+                                           pairwise = TRUE,
+                                           type = "H",
+                                           seed = 1801)
+
+
+interact.fat.diasseco.Plot <- interact.fat.diasseco$data %>% 
+  filter(row_number() %in% grep("diasseco", variable)) %>% 
+  mutate(variable = recode(variable, "diaslactacao:diasseco" = "Lactation length:Dry period length",
+                           "numeroordenhas:diasseco" = "Milking frequency:Dry period length",
+                           "idade.parto:diasseco" = "Calving age:Dry period length",
+                           "status.do.nascimento.da.cria:diasseco" = "Calf status at birth:Dry period length",
+                           "ordem.parto.stats:diasseco" = "Parity number:Dry period length")) %>% 
+  ggplot(aes(x = value,
+             y = reorder(variable, + value))) +
+  geom_col(width = 0.03,
+           colour = NA, 
+           fill = "black") +
+  geom_point(shape = 23, fill="dodgerblue3", color="dodgerblue3",
+             size = 2) +
+  theme_classic() + 
+  expand_limits(x = 0, y = 0) +
+  scale_x_continuous(limits = c(0, 0.08),
+                     breaks = seq(0, 0.08, by = 0.02),
+                     expand = expansion(mult = c(0, 0.045))) + 
+  labs(x = "Interaction strengtht",
+       y = "Interaction") + 
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"), 
+        axis.title = element_text(size = 10))
+
+
+interact.fat.diasseco.Plot
+
+ggsave(interact.fat.diasseco.Plot, filename = paste(Sys.Date(), "interact.fat.diasseco.Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+
+
+
+# Accumulated Local Effect
+plan("callr", workers = 3)
+ale.fat <- FeatureEffect$new(predictor.fat, feature = "diasseco", method = "ale")
+
+
+
+# Partial dependency plot
+plan("callr", workers = 3)
+pdp.fat <- FeatureEffect$new(predictor.fat, feature = "diasseco", method = "pdp")
+
+
+pdp.fat.plot <- plot(pdp.fat) +
+  geom_smooth(method = "loess", se = TRUE) +
+  theme_classic(base_family = "Times New Roman") + 
+  scale_x_continuous(limits = c(0, 120),
+                     breaks = seq(0, 120, by = 20),
+                     expand = expansion(mult = c(0, 0.02))) + 
+  scale_y_continuous() + 
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.line = element_line("black"), 
+        axis.title = element_text(size = 10)) + 
+  xlab("Dry period length (day)") + 
+  ylab("Predicted fat production (kg)")
+
+
+ggsave(pdp.fat.plot, filename = paste(Sys.Date(), "fat_PDP_Dry Period_Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+# Individual conditional Expectation
+plan("callr", workers = 3)
+center.ice.fat <- FeatureEffect$new(predictor.fat, feature = "diasseco",
+                                    center.at = min(hol.ml$diasseco), 
+                                    method = "pdp+ice") 
+
+center.ice.fat.plot <- plot(center.ice.fat) +
+  theme_classic(base_family = "Times New Roman") + 
+  scale_x_continuous(limits = c(0, 120),
+                     breaks = seq(0, 120, by = 20),
+                     expand = expansion(mult = c(0, 0.02))) + 
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.line = element_line("black"), 
+        axis.title = element_text(size = 10)) + 
+  xlab("Dry period length (day)")
+
+ggsave(center.ice.fat.plot, filename = paste(Sys.Date(), "fat_cICE_Dry Period_Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+
+# prot production ####
+
+# Creating folds for 10 fold cross-validation
+
+set.seed(1801)
+folds <- createFolds(train.prot$prodprot305dias, k = 10, list=TRUE)
+
+
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "random",
+                            index = folds,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", complete = TRUE),
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+cl <- makePSOCKcluster(4)
+registerDoParallel(cl, cores = 4)
+
+getDoParWorkers()
+
+# Gradient boosting machine ####
+
+set.seed(1801)
+gbm_prot <- train(prodprot305dias ~ ., 
+                  data = train.prot, 
+                  method = "gbm",
+                  metric = "RMSE",
+                  trControl = fit_control,
+                  # tuneGrid = expand.grid(interaction.depth = seq(1, 10, by = 1), 
+                  #                        n.trees = seq(1000, 5000, by = 500), 
+                  #                        shrinkage = seq(0.05, 0.55, by = 0.05),
+                  #                        n.minobsinnode = seq(20, 100, by = 10)),
+                  tuneLength = 30)
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+
+# Extreme gradient boosting machine ####
+
+set.seed(1801)
+xgbm_prot <- train(prodprot305dias ~ ., 
+                   data = train.prot, 
+                   method = "xgbTree",
+                   metric = "RMSE",
+                   trControl = fit_control,
+                   # tuneGrid = expand.grid(eta = seq(0.05, 0.55, by = 0.05),
+                   #                        max.depth = seq(1, 10, by = 1),
+                   #                        gamma = seq(2, 6, by = 0.5),
+                   #                        colsample_bytree = seq(0.45, 0.60, by = 0.05),
+                   #                        min_child_weight = seq(1, 20, by = 1), 
+                   #                        subsample = seq(0.30, 0.40, by = 0.01),
+                   #                        nrounds = seq(700, 1000, by = 50)),
+                   tuneLength = 30)
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+# Random Forest ####
+
+set.seed(1801)
+rf_prot <- train(prodprot305dias ~ ., 
+                 data = train.prot, 
+                 method = "ranger",
+                 metric = "RMSE",
+                 trControl = fit_control,
+                 tuneLength = 30)
+
+stopCluster(cl)
+
+
+# Artificial neural network ####
+folds.h2o <- data.frame(row.number = integer(),
+                        folds = numeric())
+
+for(i in c(1:10)) {
+  
+  folds.h2o <- folds[[i]] %>% 
+    as.data.frame() %>% 
+    rename("row.number" = ".") %>% 
+    mutate(folds = i) %>% 
+    rbind(folds.h2o)
+  
+}
+
+
+# Import data into H2O
+h2o.init(nthreads = -1)
+
+h2o.train.prot <- as.h2o(train.prot %>% 
+                           mutate(row.number = c(1:length(diasseco))) %>% 
+                           left_join(folds.h2o, by = "row.number") %>% 
+                           select(-row.number))
+h2o.valid.prot <- as.h2o(valid.prot) # For the validation of the model
+
+
+
+# Grid for random hyperparameters search
+hyper_params <- list(
+  activation = c("RectifierWithDropout", "TanhWithDropout", "MaxoutWithDropout"),
+  hidden = list(c(150, 150), c(rep(150, 3)), c(rep(150, 4)),
+                c(200, 200), c(rep(200, 3)), c(rep(200, 4)),
+                c(250, 250), c(rep(250, 3)), c(rep(250, 4))),
+  input_dropout_ratio = c(0, 0.05, 0.10, 0.15))
+
+hyper_params
+
+
+
+ann_search <- h2o.grid(algorithm="deeplearning",
+                       grid_id = "dl_grid_random",
+                       y = "prodprot305dias",
+                       training_frame = h2o.train.prot,
+                       fold_column = "folds",
+                       max_w2 = 10, # can help improve stability for Rectifier
+                       seed = 1801,
+                       model_id = "h2o.ANN.prot",
+                       reproducible = TRUE, 
+                       hyper_params = hyper_params,
+                       search_criteria = list(strategy = "RandomDiscrete",
+                                              stopping_metric = "RMSE",
+                                              stopping_tolerance = 0.0001,
+                                              stopping_rounds = 5)
+)
+
+
+grid <- h2o.getGrid("dl_grid_random",
+                    sort_by = "RMSE",
+                    decreasing=FALSE)
+grid
+
+ann_prot <- h2o.getModel(grid@model_ids[[1]]) ## model with lowest RMSE
+ann_prot
+
+
+h2o.saveModel(ann_prot, path = getwd(), force = TRUE)
+
+# ann_prot <- h2o.loadModel("h2o.ANN.prot_model_1")
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+
+# Evaluating models ####
+res.prot <- ModelEvaluation(gbm_prot, 
+                            train.prot, valid.prot, 
+                            train.prot$prodprot305dias, valid.prot$prodprot305dias)%>% 
+  rename("GBM" = "result") %>% 
+  right_join(
+    ModelEvaluation(xgbm_prot, 
+                    train.prot, valid.prot, 
+                    train.prot$prodprot305dias, valid.prot$prodprot305dias)%>% 
+      rename("XGBM" = "result") , by = "metric") %>% 
+  right_join(ModelEvaluation(rf_prot, 
+                             train.prot, valid.prot, 
+                             train.prot$prodprot305dias, valid.prot$prodprot305dias)%>% 
+               rename("RF" = "result"), by = "metric") %>% 
+  right_join(ModelEvaluation(ann_prot,
+                             h2o.train.prot, h2o.valid.prot,
+                             train.prot$prodprot305dias, valid.prot$prodprot305dias) %>%
+               rename("ANN" = "result"),
+             by = "metric")
+
+res.prot[7:10,] %>% 
+  print(digits = 2)
+
+
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+
+h2o.shutdown(prompt = FALSE)
+
+
+# Interpreting the best model ####
+predictor.prot <- Predictor$new(model = rf_prot, 
+                                data = hol.ml %>% 
+                                  select(-prodleite305dias, -prodgord305dias, -prodlactose305dias, -prodsolidos305dias), 
+                                y = "prodprot305dias")
+
+flashlight.prot <- flashlight(model = rf_prot, 
+                              data = hol.ml %>% 
+                                select(-prodleite305dias, -prodgord305dias, -prodlactose305dias, -prodsolidos305dias), 
+                              y = "prodprot305dias",
+                              label = "flashlight.prot")
+
+
+# Creates a PSOCK cluster with 3 cores (4 cores crashed my computer)
+plan("callr", workers = 3)
+imp.prot <- FeatureImp$new(predictor.prot, loss = "rmse")
+
+windowsFonts(Times=windowsFont("TT Times New Roman"))
+
+
+varImpPlot.prot <- ggplot(data = imp.prot$results %>% 
+                            mutate(feature = recode(feature, diaslactacao = "Lactation length",
+                                                    cliente = "Herd",
+                                                    ano.parto = "Calving year",
+                                                    numeroordenhas = "Milking frequency",
+                                                    diasseco = "Dry period length",
+                                                    estacao.parto = "Calving season",
+                                                    idade.parto = "Calving age",
+                                                    status.do.nascimento.da.cria = "Calf status at birth",
+                                                    ordem.parto.stats = "Parity number")) %>% 
+                            filter(!(feature %in% c("Herd", "Calving year", "Calving season"))),
+                          aes(x = importance,
+                              y = reorder(feature, + importance))) +
+  geom_col(width = 0.03,
+           colour = NA, 
+           fill = "black") +
+  geom_point(shape = 23, fill="dodgerblue3", color="dodgerblue3",
+             size = 2) +
+  theme_classic(base_family = "Times New Roman") + 
+  expand_limits(x = 0, y = 0) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.045)),
+                     breaks = seq(0, 3.5, by = 0.5),
+                     limits = c(0, 3.5)) + 
+  coord_cartesian(xlim=c(0.8, 3.5)) + 
+  labs(x = "Variable importance") + 
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"),
+        axis.title.y = element_blank(), 
+        axis.title = element_text(size = 10))
+
+
+varImpPlot.prot
+
+ggsave(varImpPlot.prot, filename = paste(Sys.Date(), "prot_VarImp_Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+# Interactions
+interact.prot <- light_interaction(x = flashlight.prot,
+                                   v = var.names.interaction,
+                                   type = "H",
+                                   seed = 1801)
+
+
+interact.prot.Plot <- interact.prot$data %>% 
+  mutate(variable = recode(variable, diaslactacao = "Lactation length",
+                           numeroordenhas = "Milking frequency",
+                           diasseco = "Dry period length",
+                           idade.parto = "Calving age",
+                           status.do.nascimento.da.cria = "Calf status at birth",
+                           ordem.parto.stats = "Parity number")) %>% 
+  ggplot(aes(x = value,
+             y = reorder(variable, + value))) +
+  geom_col(width = 0.03,
+           colour = NA, 
+           fill = "black") +
+  geom_point(shape = 23, fill="dodgerblue3", color="dodgerblue3",
+             size = 2) +
+  theme_classic() + 
+  expand_limits(x = 0, y = 0) +
+  scale_x_continuous(limits = c(0, 0.25),
+                     breaks = seq(0, 0.25, by = 0.05),
+                     expand = expansion(mult = c(0, 0.045))) + 
+  labs(x = "Interaction strengtht") + 
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"), 
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 10))
+
+interact.prot.Plot
+
+ggsave(interact.prot.Plot, filename = paste(Sys.Date(), "interact.prot.Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+
+# Exploring interactions with dry period
+interact.prot.diasseco <- light_interaction(x = flashlight.prot,
+                                            v = var.names.interaction,
+                                            pairwise = TRUE,
+                                            type = "H",
+                                            seed = 1801)
+
+
+interact.prot.diasseco.Plot <- interact.prot.diasseco$data %>% 
+  filter(row_number() %in% grep("diasseco", variable)) %>% 
+  mutate(variable = recode(variable, "diaslactacao:diasseco" = "Lactation length:Dry period length",
+                           "numeroordenhas:diasseco" = "Milking frequency:Dry period length",
+                           "idade.parto:diasseco" = "Calving age:Dry period length",
+                           "status.do.nascimento.da.cria:diasseco" = "Calf status at birth:Dry period length",
+                           "ordem.parto.stats:diasseco" = "Parity number:Dry period length")) %>% 
+  ggplot(aes(x = value,
+             y = reorder(variable, + value))) +
+  geom_col(width = 0.03,
+           colour = NA, 
+           fill = "black") +
+  geom_point(shape = 23, fill="dodgerblue3", color="dodgerblue3",
+             size = 2) +
+  theme_classic() + 
+  expand_limits(x = 0, y = 0) +
+  scale_x_continuous(limits = c(0, 0.08),
+                     breaks = seq(0, 0.08, by = 0.02),
+                     expand = expansion(mult = c(0, 0.045))) + 
+  labs(x = "Interaction strengtht",
+       y = "Interaction") + 
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"), 
+        axis.title = element_text(size = 10))
+
+
+interact.prot.diasseco.Plot
+
+ggsave(interact.prot.diasseco.Plot, filename = paste(Sys.Date(), "interact.prot.diasseco.Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+
+# Accumulated Local Effect
+plan("callr", workers = 3)
+ale.prot <- FeatureEffect$new(predictor.prot, feature = "diasseco", method = "ale")
+
+
+
+# Partial dependency plot
+plan("callr", workers = 3)
+pdp.prot <- FeatureEffect$new(predictor.prot, feature = "diasseco", method = "pdp")
+
+
+pdp.prot.plot <- plot(pdp.prot) +
+  geom_smooth(method = "loess", se = TRUE) +
+  theme_classic(base_family = "Times New Roman") + 
+  scale_x_continuous(limits = c(0, 120),
+                     breaks = seq(0, 120, by = 20),
+                     expand = expansion(mult = c(0, 0.02))) + 
+  scale_y_continuous() + 
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.line = element_line("black"), 
+        axis.title = element_text(size = 10)) + 
+  xlab("Dry period length (day)") + 
+  ylab("Predicted protein production (kg)")
+
+
+ggsave(pdp.prot.plot, filename = paste(Sys.Date(), "prot_PDP_Dry Period_Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+
+# Individual conditional Expectation
+plan("callr", workers = 3)
+center.ice.prot <- FeatureEffect$new(predictor.prot, feature = "diasseco",
+                                     center.at = min(hol.ml$diasseco), 
+                                     method = "pdp+ice") 
+
+center.ice.prot.plot <- plot(center.ice.prot) +
+  theme_classic(base_family = "Times New Roman") + 
+  scale_x_continuous(limits = c(0, 120),
+                     breaks = seq(0, 120, by = 20),
+                     expand = expansion(mult = c(0, 0.02))) + 
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.line = element_line("black"), 
+        axis.title = element_text(size = 10)) + 
+  xlab("Dry period length (day)")
+
+ggsave(center.ice.prot.plot, filename = paste(Sys.Date(), "prot_cICE_Dry Period_Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+# lactose production ####
+
+# Creating folds for 10 fold cross-validation
+
+set.seed(1801)
+folds <- createFolds(train.lactose$prodlactose305dias, k = 10, list=TRUE)
+
+
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "random",
+                            index = folds,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", complete = TRUE),
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+cl <- makePSOCKcluster(4)
+registerDoParallel(cl, cores = 4)
+
+getDoParWorkers()
+
+# Gradient boosting machine ####
+
+set.seed(1801)
+gbm_lactose <- train(prodlactose305dias ~ ., 
+                     data = train.lactose, 
+                     method = "gbm",
+                     metric = "RMSE",
+                     trControl = fit_control,
+                     # tuneGrid = expand.grid(interaction.depth = seq(1, 10, by = 1), 
+                     #                        n.trees = seq(1000, 5000, by = 500), 
+                     #                        shrinkage = seq(0.05, 0.55, by = 0.05),
+                     #                        n.minobsinnode = seq(20, 100, by = 10)),
+                     tuneLength = 30)
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+
+# Extreme gradient boosting machine ####
+
+set.seed(1801)
+xgbm_lactose <- train(prodlactose305dias ~ ., 
+                      data = train.lactose, 
+                      method = "xgbTree",
+                      metric = "RMSE",
+                      trControl = fit_control,
+                      # tuneGrid = expand.grid(eta = seq(0.05, 0.55, by = 0.05),
+                      #                        max.depth = seq(1, 10, by = 1),
+                      #                        gamma = seq(2, 6, by = 0.5),
+                      #                        colsample_bytree = seq(0.45, 0.60, by = 0.05),
+                      #                        min_child_weight = seq(1, 20, by = 1), 
+                      #                        subsample = seq(0.30, 0.40, by = 0.01),
+                      #                        nrounds = seq(700, 1000, by = 50)),
+                      tuneLength = 30)
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+# Random Forest ####
+
+set.seed(1801)
+rf_lactose <- train(prodlactose305dias ~ ., 
+                    data = train.lactose, 
+                    method = "ranger",
+                    metric = "RMSE",
+                    trControl = fit_control,
+                    tuneLength = 30)
+
+stopCluster(cl)
+
+
+# Artificial neural network ####
+folds.h2o <- data.frame(row.number = integer(),
+                        folds = numeric())
+
+for(i in c(1:10)) {
+  
+  folds.h2o <- folds[[i]] %>% 
+    as.data.frame() %>% 
+    rename("row.number" = ".") %>% 
+    mutate(folds = i) %>% 
+    rbind(folds.h2o)
+  
+}
+
+
+# Import data into H2O
+h2o.init(nthreads = -1)
+
+h2o.train.lactose <- as.h2o(train.lactose %>% 
+                              mutate(row.number = c(1:length(diasseco))) %>% 
+                              left_join(folds.h2o, by = "row.number") %>% 
+                              select(-row.number))
+h2o.valid.lactose <- as.h2o(valid.lactose) # For the validation of the model
+
+
+
+# Grid for random hyperparameters search
+hyper_params <- list(
+  activation = c("RectifierWithDropout", "TanhWithDropout", "MaxoutWithDropout"),
+  hidden = list(c(150, 150), c(rep(150, 3)), c(rep(150, 4)),
+                c(200, 200), c(rep(200, 3)), c(rep(200, 4)),
+                c(250, 250), c(rep(250, 3)), c(rep(250, 4))),
+  input_dropout_ratio = c(0, 0.05, 0.10, 0.15))
+
+hyper_params
+
+
+
+ann_search <- h2o.grid(algorithm="deeplearning",
+                       grid_id = "dl_grid_random",
+                       y = "prodlactose305dias",
+                       training_frame = h2o.train.lactose,
+                       fold_column = "folds",
+                       max_w2 = 10, # can help improve stability for Rectifier
+                       seed = 1801,
+                       model_id = "h2o.ANN.lactose",
+                       reproducible = TRUE, 
+                       hyper_params = hyper_params,
+                       search_criteria = list(strategy = "RandomDiscrete",
+                                              stopping_metric = "RMSE",
+                                              stopping_tolerance = 0.0001,
+                                              stopping_rounds = 5)
+)
+
+
+grid <- h2o.getGrid("dl_grid_random",
+                    sort_by = "RMSE",
+                    decreasing=FALSE)
+grid
+
+ann_lactose <- h2o.getModel(grid@model_ids[[1]]) ## model with lowest RMSE
+ann_lactose
+
+
+h2o.saveModel(ann_lactose, path = getwd(), force = TRUE)
+
+# ann_lactose <- h2o.loadModel("h2o.ANN.lactose")
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+
+# Evaluating models ####
+res.lactose <- ModelEvaluation(gbm_lactose, 
+                               train.lactose, valid.lactose, 
+                               train.lactose$prodlactose305dias, valid.lactose$prodlactose305dias)%>% 
+  rename("GBM" = "result") %>% 
+  right_join(
+    ModelEvaluation(xgbm_lactose, 
+                    train.lactose, valid.lactose, 
+                    train.lactose$prodlactose305dias, valid.lactose$prodlactose305dias)%>% 
+      rename("XGBM" = "result") , by = "metric") %>% 
+  right_join(ModelEvaluation(rf_lactose, 
+                             train.lactose, valid.lactose, 
+                             train.lactose$prodlactose305dias, valid.lactose$prodlactose305dias)%>% 
+               rename("RF" = "result"), by = "metric") %>% 
+  right_join(ModelEvaluation(ann_lactose,
+                             h2o.train.lactose, h2o.valid.lactose,
+                             train.lactose$prodlactose305dias, valid.lactose$prodlactose305dias) %>%
+               rename("ANN" = "result"),
+             by = "metric")
+
+res.lactose[7:10,] %>% 
+  print(digits = 2)
+
+
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+
+h2o.shutdown(prompt = FALSE)
+
+# Interpreting the best model ####
+predictor.lactose <- Predictor$new(model = rf_lactose, 
+                                   data = hol.ml %>% 
+                                     select(-prodleite305dias, -prodgord305dias, -prodprot305dias,-prodsolidos305dias), 
+                                   y = "prodlactose305dias")
+
+flashlight.lactose <- flashlight(model = rf_lactose, 
+                                 data = hol.ml %>% 
+                                   select(-prodleite305dias, -prodgord305dias, -prodprot305dias,-prodsolidos305dias), 
+                                 y = "prodlactose305dias",
+                                 label = "flashlight.lactose")
+
+
+# Creates a PSOCK cluster with 3 cores (4 cores crashed my computer)
+plan("callr", workers = 3)
+imp.lactose <- FeatureImp$new(predictor.lactose, loss = "rmse")
+
+windowsFonts(Times=windowsFont("TT Times New Roman"))
+
+
+varImpPlot.lactose <- ggplot(data = imp.lactose$results %>% 
+                               mutate(feature = recode(feature, diaslactacao = "Lactation length",
+                                                       cliente = "Herd",
+                                                       ano.parto = "Calving year",
+                                                       numeroordenhas = "Milking frequency",
+                                                       diasseco = "Dry period length",
+                                                       estacao.parto = "Calving season",
+                                                       idade.parto = "Calving age",
+                                                       status.do.nascimento.da.cria = "Calf status at birth",
+                                                       ordem.parto.stats = "Parity number")) %>% 
+                               filter(!(feature %in% c("Herd", "Calving year", "Calving season"))),
+                             aes(x = importance,
+                                 y = reorder(feature, + importance))) +
+  geom_col(width = 0.03,
+           colour = NA, 
+           fill = "black") +
+  geom_point(shape = 23, fill="dodgerblue3", color="dodgerblue3",
+             size = 2) +
+  theme_classic(base_family = "Times New Roman") + 
+  expand_limits(x = 0, y = 0) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.045)),
+                     breaks = seq(0, 3.5, by = 0.5),
+                     limits = c(0, 3.5)) + 
+  coord_cartesian(xlim=c(0.8, 3.2)) + 
+  labs(x = "Variable importance") + 
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"), 
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 10))
+
+
+varImpPlot.lactose
+
+ggsave(varImpPlot.lactose, filename = paste(Sys.Date(), "lactose_VarImp_Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+# Interactions
+interact.lactose <- light_interaction(x = flashlight.lactose,
+                                      v = var.names.interaction,
+                                      type = "H",
+                                      seed = 1801)
+
+
+interact.lactose.Plot <- interact.lactose$data %>% 
+  mutate(variable = recode(variable, diaslactacao = "Lactation length",
+                           numeroordenhas = "Milking frequency",
+                           diasseco = "Dry period length",
+                           idade.parto = "Calving age",
+                           status.do.nascimento.da.cria = "Calf status at birth",
+                           ordem.parto.stats = "Parity number")) %>% 
+  ggplot(aes(x = value,
+             y = reorder(variable, + value))) +
+  geom_col(width = 0.03,
+           colour = NA, 
+           fill = "black") +
+  geom_point(shape = 23, fill="dodgerblue3", color="dodgerblue3",
+             size = 2) +
+  theme_classic() + 
+  expand_limits(x = 0, y = 0) +
+  scale_x_continuous(limits = c(0, 0.25),
+                     breaks = seq(0, 0.25, by = 0.05),
+                     expand = expansion(mult = c(0, 0.045))) + 
+  labs(x = "Interaction strengtht") + 
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"), 
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 10))
+
+interact.lactose.Plot
+
+ggsave(interact.lactose.Plot, filename = paste(Sys.Date(), "interact.lactose.Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+
+# Exploring interactions with dry period
+interact.lactose.diasseco <- light_interaction(x = flashlight.lactose,
+                                               v = var.names.interaction,
+                                               pairwise = TRUE,
+                                               type = "H",
+                                               seed = 1801)
+
+
+interact.lactose.diasseco.Plot <- interact.lactose.diasseco$data %>% 
+  filter(row_number() %in% grep("diasseco", variable)) %>% 
+  mutate(variable = recode(variable, "diaslactacao:diasseco" = "Lactation length:Dry period length",
+                           "numeroordenhas:diasseco" = "Milking frequency:Dry period length",
+                           "idade.parto:diasseco" = "Calving age:Dry period length",
+                           "status.do.nascimento.da.cria:diasseco" = "Calf status at birth:Dry period length",
+                           "ordem.parto.stats:diasseco" = "Parity number:Dry period length")) %>% 
+  ggplot(aes(x = value,
+             y = reorder(variable, + value))) +
+  geom_col(width = 0.03,
+           colour = NA, 
+           fill = "black") +
+  geom_point(shape = 23, fill="dodgerblue3", color="dodgerblue3",
+             size = 2) +
+  theme_classic() + 
+  expand_limits(x = 0, y = 0) +
+  scale_x_continuous(limits = c(0, 0.08),
+                     breaks = seq(0, 0.08, by = 0.02),
+                     expand = expansion(mult = c(0, 0.045))) + 
+  labs(x = "Interaction strengtht",
+       y = "Interaction") + 
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"), 
+        axis.title = element_text(size = 10))
+
+
+interact.lactose.diasseco.Plot
+
+ggsave(interact.lactose.diasseco.Plot, filename = paste(Sys.Date(), "interact.lactose.diasseco.Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+
+
+# Partial dependency plot
+plan("callr", workers = 3)
+pdp.lactose <- FeatureEffect$new(predictor.lactose, feature = "diasseco", method = "pdp")
+
+pdp.lactose.plot <- plot(pdp.lactose) +
+  geom_smooth(method = "loess", se = TRUE) +
+  theme_classic(base_family = "Times New Roman") + 
+  scale_x_continuous(limits = c(0, 120),
+                     breaks = seq(0, 120, by = 20),
+                     expand = expansion(mult = c(0, 0.02))) + 
+  scale_y_continuous() + 
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.line = element_line("black"), 
+        axis.title = element_text(size = 10)) + 
+  xlab("Dry period length (day)") + 
+  ylab("Predicted lactose production (kg)")
+
+
+ggsave(pdp.lactose.plot, filename = paste(Sys.Date(), "lactose_PDP_Dry Period_Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+
+# Individual conditional Expectation
+plan("callr", workers = 3)
+center.ice.lactose <- FeatureEffect$new(predictor.lactose, feature = "diasseco",
+                                        center.at = min(hol.ml$diasseco), 
+                                        method = "pdp+ice") 
+
+center.ice.lactose.plot <- plot(center.ice.lactose) +
+  theme_classic(base_family = "Times New Roman") + 
+  scale_x_continuous(limits = c(0, 120),
+                     breaks = seq(0, 120, by = 20),
+                     expand = expansion(mult = c(0, 0.02))) + 
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.line = element_line("black"), 
+        axis.title = element_text(size = 10)) + 
+  xlab("Dry period length (day)")
+
+ggsave(center.ice.lactose.plot, filename = paste(Sys.Date(), "lactose_cICE_Dry Period_Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+# solid production ####
+
+# Creating folds for 10 fold cross-validation
+
+set.seed(1801)
+folds <- createFolds(train.solid$prodsolidos305dias, k = 10, list=TRUE)
+
+
+fit_control <- trainControl(method = "adaptive_cv",
+                            search = "random",
+                            index = folds,
+                            adaptive = list(min = 5, alpha = 0.05, 
+                                            method = "gls", complete = TRUE),
+                            allowParallel = TRUE,
+                            verboseIter = TRUE)
+
+cl <- makePSOCKcluster(4)
+registerDoParallel(cl, cores = 4)
+
+getDoParWorkers()
+
+# Gradient boosting machine ####
+
+set.seed(1801)
+gbm_solid <- train(prodsolidos305dias ~ ., 
+                   data = train.solid, 
+                   method = "gbm",
+                   metric = "RMSE",
+                   trControl = fit_control,
+                   # tuneGrid = expand.grid(interaction.depth = seq(1, 10, by = 1), 
+                   #                        n.trees = seq(1000, 5000, by = 500), 
+                   #                        shrinkage = seq(0.05, 0.55, by = 0.05),
+                   #                        n.minobsinnode = seq(20, 100, by = 10)),
+                   tuneLength = 30)
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+
+# Extreme gradient boosting machine ####
+
+set.seed(1801)
+xgbm_solid <- train(prodsolidos305dias ~ ., 
+                    data = train.solid, 
+                    method = "xgbTree",
+                    metric = "RMSE",
+                    trControl = fit_control,
+                    # tuneGrid = expand.grid(eta = seq(0.05, 0.55, by = 0.05),
+                    #                        max.depth = seq(1, 10, by = 1),
+                    #                        gamma = seq(2, 6, by = 0.5),
+                    #                        colsample_bytree = seq(0.45, 0.60, by = 0.05),
+                    #                        min_child_weight = seq(1, 20, by = 1), 
+                    #                        subsample = seq(0.30, 0.40, by = 0.01),
+                    #                        nrounds = seq(700, 1000, by = 50)),
+                    tuneLength = 30)
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+# Random Forest ####
+
+set.seed(1801)
+rf_solid <- train(prodsolidos305dias ~ ., 
+                  data = train.solid, 
+                  method = "ranger",
+                  metric = "RMSE",
+                  trControl = fit_control,
+                  tuneLength = 30)
+
+stopCluster(cl)
+
+
+# Artificial neural network ####
+folds.h2o <- data.frame(row.number = integer(),
+                        folds = numeric())
+
+for(i in c(1:10)) {
+  
+  folds.h2o <- folds[[i]] %>% 
+    as.data.frame() %>% 
+    rename("row.number" = ".") %>% 
+    mutate(folds = i) %>% 
+    rbind(folds.h2o)
+  
+}
+
+
+# Import data into H2O
+h2o.init(nthreads = -1)
+
+h2o.train.solid <- as.h2o(train.solid %>% 
+                            mutate(row.number = c(1:length(diasseco))) %>% 
+                            left_join(folds.h2o, by = "row.number") %>% 
+                            select(-row.number))
+h2o.valid.solid <- as.h2o(valid.solid) # For the validation of the model
+
+
+
+# Grid for random hyperparameters search
+hyper_params <- list(
+  activation = c("RectifierWithDropout", "TanhWithDropout", "MaxoutWithDropout"),
+  hidden = list(c(150, 150), c(rep(150, 3)), c(rep(150, 4)),
+                c(200, 200), c(rep(200, 3)), c(rep(200, 4)),
+                c(250, 250), c(rep(250, 3)), c(rep(250, 4))),
+  input_dropout_ratio = c(0, 0.05, 0.10, 0.15))
+
+hyper_params
+
+
+
+ann_search <- h2o.grid(algorithm="deeplearning",
+                       grid_id = "dl_grid_random",
+                       y = "prodsolidos305dias",
+                       training_frame = h2o.train.solid,
+                       fold_column = "folds",
+                       max_w2 = 10, # can help improve stability for Rectifier
+                       seed = 1801,
+                       model_id = "h2o.ANN.solid",
+                       reproducible = TRUE, 
+                       hyper_params = hyper_params,
+                       search_criteria = list(strategy = "RandomDiscrete",
+                                              stopping_metric = "RMSE",
+                                              stopping_tolerance = 0.0001,
+                                              stopping_rounds = 5)
+)
+
+
+grid <- h2o.getGrid("dl_grid_random",
+                    sort_by = "RMSE",
+                    decreasing=FALSE)
+grid
+
+ann_solid <- h2o.getModel(grid@model_ids[[1]]) ## model with lowest RMSE
+ann_solid
+
+
+h2o.saveModel(ann_solid, path = getwd(), force = TRUE)
+
+# ann_solid <- h2o.loadModel("h2o.ANN.solid")
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+
+# Evaluating models ####
+res.solid <- ModelEvaluation(gbm_solid, 
+                             train.solid, valid.solid, 
+                             train.solid$prodsolidos305dias, valid.solid$prodsolidos305dias)%>% 
+  rename("GBM" = "result") %>% 
+  right_join(
+    ModelEvaluation(xgbm_solid, 
+                    train.solid, valid.solid, 
+                    train.solid$prodsolidos305dias, valid.solid$prodsolidos305dias)%>% 
+      rename("XGBM" = "result") , by = "metric") %>% 
+  right_join(ModelEvaluation(rf_solid, 
+                             train.solid, valid.solid, 
+                             train.solid$prodsolidos305dias, valid.solid$prodsolidos305dias)%>% 
+               rename("RF" = "result"), by = "metric") %>% 
+  right_join(ModelEvaluation(ann_solid,
+                             h2o.train.solid, h2o.valid.solid,
+                             train.solid$prodsolidos305dias, valid.solid$prodsolidos305dias) %>%
+               rename("ANN" = "result"),
+             by = "metric")
+
+res.solid[7:10,] %>% 
+  print(digits = 2)
+
+
+
+save.image(paste(Sys.Date(), "Models_Image.RData", sep = "_"))
+
+
+h2o.shutdown(prompt = FALSE)
+
+# Interpreting the best model ####
+predictor.solid <- Predictor$new(model = rf_solid, 
+                                 data = hol.ml %>% 
+                                   select(-prodleite305dias, -prodgord305dias, -prodprot305dias, -prodlactose305dias), 
+                                 y = "prodsolidos305dias")
+
+flashlight.solid <- flashlight(model = rf_solid, 
+                               data = hol.ml %>% 
+                                 select(-prodleite305dias, -prodgord305dias, -prodprot305dias, -prodlactose305dias), 
+                               y = "prodsolidos305dias",
+                               label = "flashlight.solid")
+
+
+# Creates a PSOCK cluster with 3 cores (4 cores crashed my computer)
+plan("callr", workers = 3)
+imp.solid <- FeatureImp$new(predictor.solid, loss = "rmse")
+
+windowsFonts(Times=windowsFont("TT Times New Roman"))
+
+
+varImpPlot.solid <- ggplot(data = imp.solid$results %>% 
+                             mutate(feature = recode(feature, diaslactacao = "Lactation length",
+                                                     cliente = "Herd",
+                                                     ano.parto = "Calving year",
+                                                     numeroordenhas = "Milking frequency",
+                                                     diasseco = "Dry period length",
+                                                     estacao.parto = "Calving season",
+                                                     idade.parto = "Calving age",
+                                                     status.do.nascimento.da.cria = "Calf status at birth",
+                                                     ordem.parto.stats = "Parity number")) %>% 
+                             filter(!(feature %in% c("Herd", "Calving year", "Calving season"))),
+                           aes(x = importance,
+                               y = reorder(feature, + importance))) +
+  geom_col(width = 0.03,
+           colour = NA, 
+           fill = "black") +
+  geom_point(shape = 23, fill="dodgerblue3", color="dodgerblue3",
+             size = 2) +
+  theme_classic(base_family = "Times New Roman") + 
+  expand_limits(x = 0, y = 0) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.045)),
+                     breaks = seq(0, 3.5, by = 0.5),
+                     limits = c(0, 3.5)) + 
+  coord_cartesian(xlim=c(0.8, 3.2)) + 
+  labs(x = "Variable importance") + 
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"),
+        axis.title.y = element_blank(), 
+        axis.title = element_text(size = 10))
+
+
+varImpPlot.solid
+
+ggsave(varImpPlot.solid, filename = paste(Sys.Date(), "solid_VarImp_Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+# Interactions
+interact.solid <- light_interaction(x = flashlight.solid,
+                                    v = var.names.interaction,
+                                    type = "H",
+                                    seed = 1801)
+
+
+interact.solid.Plot <- interact.solid$data %>% 
+  mutate(variable = recode(variable, diaslactacao = "Lactation length",
+                           numeroordenhas = "Milking frequency",
+                           diasseco = "Dry period length",
+                           idade.parto = "Calving age",
+                           status.do.nascimento.da.cria = "Calf status at birth",
+                           ordem.parto.stats = "Parity number")) %>% 
+  ggplot(aes(x = value,
+             y = reorder(variable, + value))) +
+  geom_col(width = 0.03,
+           colour = NA, 
+           fill = "black") +
+  geom_point(shape = 23, fill="dodgerblue3", color="dodgerblue3",
+             size = 2) +
+  theme_classic() + 
+  expand_limits(x = 0, y = 0) +
+  scale_x_continuous(limits = c(0, 0.25),
+                     breaks = seq(0, 0.25, by = 0.05),
+                     expand = expansion(mult = c(0, 0.045))) + 
+  labs(x = "Interaction strengtht") + 
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"), 
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 10))
+
+interact.solid.Plot
+
+ggsave(interact.solid.Plot, filename = paste(Sys.Date(), "interact.solid.Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+
+# Exploring interactions with dry period
+interact.solid.diasseco <- light_interaction(x = flashlight.solid,
+                                             v = var.names.interaction,
+                                             pairwise = TRUE,
+                                             type = "H",
+                                             seed = 1801)
+
+
+interact.solid.diasseco.Plot <- interact.solid.diasseco$data %>% 
+  filter(row_number() %in% grep("diasseco", variable)) %>% 
+  mutate(variable = recode(variable, "diaslactacao:diasseco" = "Lactation length:Dry period length",
+                           "numeroordenhas:diasseco" = "Milking frequency:Dry period length",
+                           "idade.parto:diasseco" = "Calving age:Dry period length",
+                           "status.do.nascimento.da.cria:diasseco" = "Calf status at birth:Dry period length",
+                           "ordem.parto.stats:diasseco" = "Parity number:Dry period length")) %>% 
+  ggplot(aes(x = value,
+             y = reorder(variable, + value))) +
+  geom_col(width = 0.03,
+           colour = NA, 
+           fill = "black") +
+  geom_point(shape = 23, fill="dodgerblue3", color="dodgerblue3",
+             size = 2) +
+  theme_classic() + 
+  expand_limits(x = 0, y = 0) +
+  scale_x_continuous(limits = c(0, 0.08),
+                     breaks = seq(0, 0.08, by = 0.02),
+                     expand = expansion(mult = c(0, 0.045))) + 
+  labs(x = "Interaction strengtht",
+       y = "Interaction") + 
+  theme_classic(base_family = "Times New Roman") +
+  theme(axis.text = element_text(size = 8, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.ticks.y = element_line(NA),
+        axis.line = element_line("black"), 
+        axis.title = element_text(size = 10))
+
+
+interact.solid.diasseco.Plot
+
+ggsave(interact.solid.diasseco.Plot, filename = paste(Sys.Date(), "interact.solid.diasseco.Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+
+# Partial dependency plot
+plan("callr", workers = 3)
+pdp.solid <- FeatureEffect$new(predictor.solid, feature = "diasseco", method = "pdp")
+
+pdp.solid.plot <- plot(pdp.solid) +
+  geom_smooth(method = "loess", se = TRUE) +
+  theme_classic(base_family = "Times New Roman") + 
+  scale_x_continuous(limits = c(0, 120),
+                     breaks = seq(0, 120, by = 20),
+                     expand = expansion(mult = c(0, 0.02))) + 
+  scale_y_continuous() + 
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.line = element_line("black"), 
+        axis.title = element_text(size = 10)) + 
+  xlab("Dry period length (day)") + 
+  ylab("Predicted milk solids production (kg)")
+
+
+ggsave(pdp.solid.plot, filename = paste(Sys.Date(), "solid_PDP_Dry Period_Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+
+# Individual conditional Expectation
+plan("callr", workers = 3)
+center.ice.solid <- FeatureEffect$new(predictor.solid, feature = "diasseco",
+                                      center.at = min(hol.ml$diasseco), 
+                                      method = "pdp+ice") 
+
+
+center.ice.solid.plot <- plot(center.ice.solid) +
+  theme_classic(base_family = "Times New Roman") + 
+  scale_x_continuous(limits = c(0, 120),
+                     breaks = seq(0, 120, by = 20),
+                     expand = expansion(mult = c(0, 0.02))) + 
+  theme(axis.text = element_text(size = 10, color = "black"),
+        axis.ticks.x = element_line(color = "black"),
+        axis.line = element_line("black"), 
+        axis.title = element_text(size = 10)) + 
+  xlab("Dry period length (day)")
+
+ggsave(center.ice.solid.plot, filename = paste(Sys.Date(), "solid_cICE_Dry Period_Plot.jpeg", sep = "_"),
+       dpi = 750, width = 16, height = 10, units = "cm")
+
+# Final graphs ####
+
+
+# Variable importance
+varImp.plots <- plot_grid(varImpPlot.milk +
+                            coord_cartesian(xlim=c(0.8, 3.5)),
+                          varImpPlot.fat + 
+                            coord_cartesian(xlim=c(0.8, 3.5)),
+                          varImpPlot.prot + 
+                            coord_cartesian(xlim=c(0.8, 3.5)),
+                          varImpPlot.lactose + 
+                            coord_cartesian(xlim=c(0.8, 3.5)),
+                          varImpPlot.solid + 
+                            coord_cartesian(xlim=c(0.8, 3.5)),
+                          label_fontfamily = "Times New Roman",
+                          nrow = 3,
+                          labels = c("A", "B", "C", "D", "E"),
+                          label_size = 14)
+
+ggsave(plot = varImp.plots,
+       paste(Sys.Date(), "VariableImportance.jpeg", sep = "_"),
+       dpi = 750,
+       units = "cm",
+       width = 16,
+       height = 20)
+
+# Partial dependence plot
+PDP.plots <- plot_grid(pdp.milk.plot,
+                       pdp.fat.plot,
+                       pdp.prot.plot,
+                       pdp.lactose.plot,
+                       pdp.solid.plot,
+                       label_fontfamily = "Times New Roman",
+                       nrow = 3,
+                       labels = c("A", "B", "C", "D", "E"),
+                       label_size = 14)
+
+ggsave(plot = PDP.plots,
+       paste(Sys.Date(), "PDP_Plots.jpeg", sep = "_"),
+       dpi = 750,
+       units = "cm",
+       width = 16,
+       height = 22,
+       bg = "white")
+
+# Centered Ice
+cICE.plots <- plot_grid(center.ice.milk.plot,
+                        center.ice.fat.plot,
+                        center.ice.prot.plot,
+                        center.ice.lactose.plot,
+                        center.ice.solid.plot,
+                        label_fontfamily = "Times New Roman",
+                        nrow = 3,
+                        labels = c("A", "B", "C", "D", "E"),
+                        label_size = 14)
+
+ggsave(plot = cICE.plots,
+       paste(Sys.Date(), "cICE_Plots.jpeg", sep = "_"),
+       dpi = 750,
+       units = "cm",
+       width = 16,
+       height = 20)
+
